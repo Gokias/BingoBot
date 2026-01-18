@@ -5,7 +5,7 @@ import asyncio
 import random
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
 
@@ -33,6 +33,29 @@ def db_path_for_guild(guild_id: int) -> Path:
 SIGNUP_EMOJI = "✅"
 UNSIGN_EMOJI = "❌"
 APPROVE_EMOJI = "👍"
+
+# Setup wizard lists (edit these whenever you add modes)
+AVAILABLE_GAME_MODES: list[str] = [
+    "Standard OSRS Bingo",
+    "Ironman Bingo",
+    "Collection Log Bingo",
+    "Bossing / Raids Bingo",
+    "Skilling Bingo",
+    "Clue Scroll Bingo",
+    "Custom (enter your own)",
+]
+
+SHOW_BOARD_CHOICES: list[tuple[str, str]] = [
+    ("signup_created", "Post the board immediately when signups open."),
+    ("signups_close", "Post the board when signups close (teams made)."),
+    ("bingo_start", "Post the board when the bingo starts."),
+]
+
+APPROVAL_CHOICES: list[tuple[str, str]] = [
+    ("none", "Auto-approve submissions."),
+    ("admin", "Approve by a specific approver role."),
+    ("nonteammate", "Approve by someone not on the submitter's team."),
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +105,16 @@ def parse_dt_with_tz(dt_str: str, tz_str: str) -> Optional[datetime]:
     Returns UTC-aware datetime.
     """
     try:
-        tz = ZoneInfo(tz_str.strip())
+        t = tz_str.strip()
+        # Support fixed offsets like UTC+05:00 or UTC-4
+        m = re.match(r"^UTC([+-])(\d{1,2})(?::(\d{2}))?$", t.upper().replace(" ", ""))
+        if m:
+            sign = 1 if m.group(1) == "+" else -1
+            hours = int(m.group(2))
+            mins = int(m.group(3) or "0")
+            tz = timezone(sign * timedelta(hours=hours, minutes=mins))
+        else:
+            tz = ZoneInfo(t)
         naive = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
         aware = naive.replace(tzinfo=tz)
         return aware.astimezone(timezone.utc)
@@ -97,16 +129,17 @@ class GuildSettings:
     submissions_channel_id: int
     announcements_channel_id: int
     board_channel_id: int
+    approver_role_id: Optional[int] = None
 
 
 class BingoDB:
-    def __init__(self, guild_id: int):
-        self.guild_id = int(guild_id)
-        self.path = db_path_for_guild(self.guild_id)
+    def __init__(self, path: str):
+        self.path = path
         self._init_db()
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+    def _conn(self, guild_id: int) -> sqlite3.Connection:
+        db_path = db_path_for_guild(guild_id)
+        conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
@@ -121,7 +154,8 @@ class BingoDB:
                     signup_channel_id INTEGER NOT NULL,
                     submissions_channel_id INTEGER NOT NULL,
                     announcements_channel_id INTEGER NOT NULL,
-                    board_channel_id INTEGER NOT NULL
+                    board_channel_id INTEGER NOT NULL,
+                    approver_role_id INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS bingos (
@@ -186,26 +220,31 @@ class BingoDB:
                 """
             )
 
+            # Lightweight migration for older guild DBs
+            cols = [r["name"] for r in con.execute("PRAGMA table_info(guild_settings);").fetchall()]
+            if "approver_role_id" not in cols:
+                con.execute("ALTER TABLE guild_settings ADD COLUMN approver_role_id INTEGER;")
+
     # -------- guild settings --------
     def upsert_guild_settings(self, gs: GuildSettings) -> None:
         with self._conn() as con:
             con.execute(
                 """
-                INSERT INTO guild_settings (guild_id, signup_channel_id, submissions_channel_id, announcements_channel_id, board_channel_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO guild_settings (guild_id, signup_channel_id, submissions_channel_id, announcements_channel_id, board_channel_id, approver_role_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     signup_channel_id=excluded.signup_channel_id,
                     submissions_channel_id=excluded.submissions_channel_id,
                     announcements_channel_id=excluded.announcements_channel_id,
-                    board_channel_id=excluded.board_channel_id;
+                    board_channel_id=excluded.board_channel_id,
+                    approver_role_id=excluded.approver_role_id;
                 """,
-                (gs.guild_id, gs.signup_channel_id, gs.submissions_channel_id, gs.announcements_channel_id, gs.board_channel_id),
+                (gs.guild_id, gs.signup_channel_id, gs.submissions_channel_id, gs.announcements_channel_id, gs.board_channel_id, gs.approver_role_id),
             )
 
     def get_guild_settings(self, guild_id: int) -> Optional[GuildSettings]:
         with self._conn() as con:
-            # This DB instance is already scoped to a single guild.
-            row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?;", (self.guild_id,)).fetchone()
+            row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?;", (guild_id,)).fetchone()
             if not row:
                 return None
             return GuildSettings(
@@ -214,6 +253,7 @@ class BingoDB:
                 submissions_channel_id=row["submissions_channel_id"],
                 announcements_channel_id=row["announcements_channel_id"],
                 board_channel_id=row["board_channel_id"],
+                approver_role_id=row["approver_role_id"],
             )
 
     # -------- bingo lifecycle --------
@@ -225,7 +265,7 @@ class BingoDB:
                 WHERE guild_id=? AND status IN ('setup','signup_open','signup_closed','running')
                 ORDER BY id DESC LIMIT 1;
                 """,
-                (self.guild_id,),
+                (guild_id,),
             ).fetchone()
             return row
 
@@ -258,7 +298,7 @@ class BingoDB:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'signup_open', ?, ?, ?);
                 """,
                 (
-                    self.guild_id,
+                    guild_id,
                     name,
                     game_mode,
                     team_size,
@@ -433,17 +473,8 @@ intents.reactions = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# One DB per guild (Option A): cache instances so we don't constantly reopen/init.
-_DB_CACHE: dict[int, BingoDB] = {}
-
-def get_db(guild_id: int) -> BingoDB:
-    gid = int(guild_id)
-    db = _DB_CACHE.get(gid)
-    if db is None:
-        db = BingoDB(gid)
-        _DB_CACHE[gid] = db
-    return db
+db = BingoDB(db_path_for_guild(ctx.guild.id)
+)
 
 
 async def dm_ask(user: discord.abc.User, prompt: str, timeout: int = 300) -> Optional[discord.Message]:
@@ -465,6 +496,68 @@ async def dm_ask(user: discord.abc.User, prompt: str, timeout: int = 300) -> Opt
         return None
 
 
+async def dm_choose_number(
+    user: discord.abc.User,
+    prompt: str,
+    options: List[str],
+    timeout: int = 300,
+) -> Optional[int]:
+    """
+    DM the user a numbered list and return the chosen option index (0-based).
+    """
+    lines = [prompt, ""]
+    for i, opt in enumerate(options, start=1):
+        lines.append(f"{i}) {opt}")
+    lines.append("")
+    lines.append("Reply with a number.")
+    m = await dm_ask(user, "\n".join(lines), timeout=timeout)
+    if not m:
+        return None
+    n = parse_int(m.content, min_value=1, max_value=len(options))
+    if n is None:
+        try:
+            await user.send("Invalid choice. Setup cancelled.")
+        except Exception:
+            pass
+        return None
+    return int(n - 1)
+
+
+def tz_from_choice(choice: int, custom_text: Optional[str] = None) -> Optional[str]:
+    """Maps a timezone menu choice to an IANA timezone string or a fixed UTC offset."""
+    # 0-based indices matching the wizard options
+    if choice == 0:
+        return "America/Los_Angeles"
+    if choice == 1:
+        return "America/New_York"
+    if choice == 2:
+        return "Europe/London"
+    if choice == 3:
+        return "Europe/Berlin"
+    if choice == 4:
+        # Custom UTC offset like UTC+2, UTC-5
+        if not custom_text:
+            return None
+        t = custom_text.strip().upper().replace(" ", "")
+        m = re.match(r"^UTC([+-])(\d{1,2})(?::?(\d{2}))?$", t)
+        if not m:
+            return None
+        sign = 1 if m.group(1) == "+" else -1
+        hours = int(m.group(2))
+        mins = int(m.group(3) or "0")
+        if hours > 14 or mins not in (0, 15, 30, 45):
+            return None
+        # Use a fixed-offset tz via ZoneInfo? Not available. We'll handle via parsing helper.
+        # Return canonical string; parse_dt_with_tz will handle UTC± by building a fixed offset.
+        return f"UTC{m.group(1)}{hours:02d}:{mins:02d}"
+    if choice == 5:
+        # Custom IANA tz string
+        if not custom_text:
+            return None
+        return custom_text.strip()
+    return None
+
+
 def build_signup_embed(bingo: sqlite3.Row, gs: GuildSettings) -> discord.Embed:
     embed = discord.Embed(
         title=f"OSRS Bingo Signup: {bingo['name']}",
@@ -474,7 +567,9 @@ def build_signup_embed(bingo: sqlite3.Row, gs: GuildSettings) -> discord.Embed:
     embed.add_field(name="Start (UTC)", value=bingo["start_utc"], inline=False)
     embed.add_field(name="Signup closes (UTC)", value=bingo["signup_close_utc"], inline=False)
     embed.add_field(name="Team size", value=str(bingo["team_size"]), inline=True)
-    embed.add_field(name="Team selection", value=bingo["team_mode"], inline=True)
+    team_size = int(bingo["team_size"])
+    team_mode = bingo["team_mode"] if team_size > 1 else "N/A"
+    embed.add_field(name="Team selection", value=team_mode, inline=True)
     embed.add_field(name="Submissions channel", value=f"<#{gs.submissions_channel_id}>", inline=False)
     embed.set_footer(text="Bingo Bot")
     return embed
@@ -545,9 +640,43 @@ async def bingosetup(ctx: commands.Context):
         await ctx.reply("There is already an active bingo on this server. End it (not implemented yet) or remove it from the DB.")
         return
 
-    # DM wizard
     user = ctx.author
-    m = await dm_ask(user, "Bingo setup started.\n\nFirst: mention the **signup channel** like `<#123>`.")
+
+    # --- Timezone first ---
+    tz_options = [
+        "California (America/Los_Angeles)",
+        "New York (America/New_York)",
+        "London (Europe/London)",
+        "Germany (Europe/Berlin)",
+        "Custom UTC offset (UTC+2, UTC-5, UTC+05:30)",
+        "Custom IANA timezone (type it)",
+    ]
+    tz_choice = await dm_choose_number(user, "Select a timezone:", tz_options)
+    if tz_choice is None:
+        await ctx.reply("I could not DM you (or you timed out). Please enable DMs from server members and try again.")
+        return
+
+    tz_custom = None
+    if tz_choice == 4:
+        m = await dm_ask(user, "Enter UTC offset like `UTC+2`, `UTC-5`, or `UTC+05:30`.")
+        if not m:
+            await user.send("Timed out. Setup cancelled.")
+            return
+        tz_custom = m.content
+    elif tz_choice == 5:
+        m = await dm_ask(user, "Enter an IANA timezone like `America/Chicago` or `Australia/Sydney`.")
+        if not m:
+            await user.send("Timed out. Setup cancelled.")
+            return
+        tz_custom = m.content
+
+    tz_str = tz_from_choice(tz_choice, tz_custom)
+    if not tz_str:
+        await user.send("Invalid timezone. Setup cancelled.")
+        return
+
+    # --- Channels ---
+    m = await dm_ask(user, "Bingo setup started.\n\nMention the **signup channel** like `<#123>`." )
     if not m:
         await ctx.reply("I could not DM you (or you timed out). Please enable DMs from server members and try again.")
         return
@@ -556,7 +685,7 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid channel mention. Setup cancelled.")
         return
 
-    m = await dm_ask(user, "Mention the **submissions channel** like `<#123>`.")
+    m = await dm_ask(user, "Mention the **submissions channel** like `<#123>`." )
     if not m:
         await user.send("Timed out. Setup cancelled.")
         return
@@ -565,7 +694,7 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid channel mention. Setup cancelled.")
         return
 
-    m = await dm_ask(user, "Mention the **announcements channel** like `<#123>`.")
+    m = await dm_ask(user, "Mention the **announcements channel** like `<#123>`." )
     if not m:
         await user.send("Timed out. Setup cancelled.")
         return
@@ -574,7 +703,7 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid channel mention. Setup cancelled.")
         return
 
-    m = await dm_ask(user, "Mention the **bingo-board channel** like `<#123>`.")
+    m = await dm_ask(user, "Mention the **bingo-board channel** like `<#123>`." )
     if not m:
         await user.send("Timed out. Setup cancelled.")
         return
@@ -583,15 +712,21 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid channel mention. Setup cancelled.")
         return
 
+    # Pull prior guild settings if they exist (for approver role reuse)
+    prior_gs = db.get_guild_settings(ctx.guild.id)
+    approver_role_id = prior_gs.approver_role_id if prior_gs else None
+
     gs = GuildSettings(
         guild_id=ctx.guild.id,
         signup_channel_id=signup_ch,
         submissions_channel_id=submissions_ch,
         announcements_channel_id=announcements_ch,
         board_channel_id=board_ch,
+        approver_role_id=approver_role_id,
     )
     db.upsert_guild_settings(gs)
 
+    # --- Name ---
     m = await dm_ask(user, "Bingo name? (type `none` to default to your name)")
     if not m:
         await user.send("Timed out. Setup cancelled.")
@@ -600,12 +735,20 @@ async def bingosetup(ctx: commands.Context):
     if name.lower() == "none" or name == "":
         name = f"{user.display_name}'s bingo"
 
-    m = await dm_ask(user, "Game mode? (example: `Jesus' custom bingo`)")
-    if not m:
-        await user.send("Timed out. Setup cancelled.")
+    # --- Game mode (numbered list) ---
+    gm_idx = await dm_choose_number(user, "Select a game mode:", AVAILABLE_GAME_MODES)
+    if gm_idx is None:
         return
-    game_mode = m.content.strip() or "Custom"
+    if AVAILABLE_GAME_MODES[gm_idx].startswith("Custom"):
+        m = await dm_ask(user, "Type your custom game mode name:")
+        if not m:
+            await user.send("Timed out. Setup cancelled.")
+            return
+        game_mode = m.content.strip() or "Custom"
+    else:
+        game_mode = AVAILABLE_GAME_MODES[gm_idx]
 
+    # --- Team size ---
     m = await dm_ask(user, "Team size? (`0` = everyone on one team, `1` = solo, `2+` = teams)")
     if not m:
         await user.send("Timed out. Setup cancelled.")
@@ -615,36 +758,37 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid team size. Setup cancelled.")
         return
 
-    m = await dm_ask(user, "Team selection mode: `random`, `captains`, or `preferred`")
-    if not m:
-        await user.send("Timed out. Setup cancelled.")
-        return
-    team_mode = m.content.strip().lower()
-    if team_mode not in ("random", "captains", "preferred"):
-        await user.send("Invalid team mode. Setup cancelled.")
-        return
+    # If 0/1, skip team selection mode
+    if team_size <= 0:
+        team_mode = "random"
+    elif team_size == 1:
+        team_mode = "solo"
+    else:
+        team_mode_options = [
+            "Random teams (bot assigns teams when signups close)",
+            "Captains (not implemented yet)",
+            "Preferred teams (not implemented yet)",
+        ]
+        tm_idx = await dm_choose_number(user, "Select a team selection mode:", team_mode_options)
+        if tm_idx is None:
+            return
+        team_mode = ("random", "captains", "preferred")[tm_idx]
 
+    # --- Start / End ---
     m = await dm_ask(user, "Start datetime in format `YYYY-MM-DD HH:MM` (example: `2026-01-17 19:00`)")
     if not m:
         await user.send("Timed out. Setup cancelled.")
         return
-    start_str = m.content.strip()
-
-    m = await dm_ask(user, "Timezone (IANA), example: `America/New_York` or `UTC`")
-    if not m:
-        await user.send("Timed out. Setup cancelled.")
-        return
-    tz_str = m.content.strip()
-    start_utc = parse_dt_with_tz(start_str, tz_str)
+    start_utc = parse_dt_with_tz(m.content.strip(), tz_str)
     if not start_utc:
-        await user.send("Could not parse start datetime/timezone. Setup cancelled.")
+        await user.send("Could not parse start datetime for that timezone. Setup cancelled.")
         return
 
     m = await dm_ask(user, "End datetime (same format) or type `none`")
     if not m:
         await user.send("Timed out. Setup cancelled.")
         return
-    end_utc: Optional[datetime] = None
+    end_utc = None
     if m.content.strip().lower() != "none":
         end_utc = parse_dt_with_tz(m.content.strip(), tz_str)
         if not end_utc:
@@ -670,27 +814,39 @@ async def bingosetup(ctx: commands.Context):
         await user.send("Invalid role mention. Setup cancelled.")
         return
 
-    m = await dm_ask(user, "When to show the bingo board? `signup_created`, `signups_close`, or `bingo_start`")
-    if not m:
-        await user.send("Timed out. Setup cancelled.")
+    # --- When to show board (numbered list) ---
+    sb_options = [f"{k}: {desc}" for (k, desc) in SHOW_BOARD_CHOICES]
+    sb_idx = await dm_choose_number(user, "When should the bingo board be posted?", sb_options)
+    if sb_idx is None:
         return
-    show_board_when = m.content.strip().lower()
-    if show_board_when not in ("signup_created", "signups_close", "bingo_start"):
-        await user.send("Invalid choice. Setup cancelled.")
-        return
+    show_board_when = SHOW_BOARD_CHOICES[sb_idx][0]
 
-    m = await dm_ask(user, "Submissions require approval? `none`, `admin`, or `nonteammate` (nonteammate not implemented yet)")
-    if not m:
-        await user.send("Timed out. Setup cancelled.")
+    # --- Approvals (numbered list) ---
+    ap_options = [f"{k}: {desc}" for (k, desc) in APPROVAL_CHOICES]
+    ap_idx = await dm_choose_number(user, "How should submissions be approved?", ap_options)
+    if ap_idx is None:
         return
-    approvals_mode = m.content.strip().lower()
-    if approvals_mode not in ("none", "admin", "nonteammate"):
-        await user.send("Invalid choice. Setup cancelled.")
-        return
+    approvals_mode = APPROVAL_CHOICES[ap_idx][0]
 
     approvals_required = 0
-    if approvals_mode != "none":
-        m = await dm_ask(user, "How many approvals required? Example: `1`")
+    if approvals_mode == "none":
+        approvals_required = 0
+    elif approvals_mode == "admin":
+        approvals_required = 1
+        # If not already configured from a previous setup, ask for the approver role.
+        if not gs.approver_role_id:
+            m = await dm_ask(user, "Mention the Discord role that can approve submissions (like `<@&123>`).")
+            if not m:
+                await user.send("Timed out. Setup cancelled.")
+                return
+            rid = parse_role_mention(m.content)
+            if rid is None:
+                await user.send("Invalid role mention. Setup cancelled.")
+                return
+            gs.approver_role_id = rid
+            db.upsert_guild_settings(gs)
+    else:
+        m = await dm_ask(user, "How many approvals are required? Example: `1`")
         if not m:
             await user.send("Timed out. Setup cancelled.")
             return
@@ -699,8 +855,8 @@ async def bingosetup(ctx: commands.Context):
             await user.send("Invalid number. Setup cancelled.")
             return
 
-    # Optional board image upload in DM
-    await user.send("Optional: upload the bingo board image now in this DM, or type `skip`.")
+    # --- Optional board image upload in DM ---
+    await user.send("Optional: upload the bingo board image now, or type `skip`.")
     board_image_path = None
 
     def dm_check(mm: discord.Message) -> bool:
@@ -711,7 +867,7 @@ async def bingosetup(ctx: commands.Context):
         if mm.content.strip().lower() != "skip" and mm.attachments:
             att = mm.attachments[0]
             ext = os.path.splitext(att.filename)[1].lower() or ".png"
-            board_image_path = os.path.join(DATA_DIR, "boards", f"board_{ctx.guild.id}_{int(utc_now().timestamp())}{ext}")
+            board_image_path = str(DATA_DIR / "boards" / f"board_{ctx.guild.id}_{int(utc_now().timestamp())}{ext}")
             await att.save(board_image_path)
     except asyncio.TimeoutError:
         pass
@@ -874,8 +1030,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
-    db = get_db(guild.id)
-
     gs = db.get_guild_settings(guild.id)
     if not gs:
         return
@@ -913,13 +1067,21 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         member = None
 
     if approvals_mode == "admin":
-        if member and (member.guild_permissions.manage_guild or member.guild_permissions.administrator):
-            allowed = True
+        if member:
+            # If an approver role is configured for this guild, require it.
+            # Otherwise, fall back to Discord permissions.
+            if gs.approver_role_id and any(r.id == gs.approver_role_id for r in member.roles):
+                allowed = True
+            elif member.guild_permissions.manage_guild or member.guild_permissions.administrator:
+                allowed = True
     elif approvals_mode == "nonteammate":
         # Reserved for later: ensure approver is not on same team.
-        # For now, treat as admin-only to avoid abuse.
-        if member and (member.guild_permissions.manage_guild or member.guild_permissions.administrator):
-            allowed = True
+        # For now, treat as approver-role-or-admin.
+        if member:
+            if gs.approver_role_id and any(r.id == gs.approver_role_id for r in member.roles):
+                allowed = True
+            elif member.guild_permissions.manage_guild or member.guild_permissions.administrator:
+                allowed = True
     else:
         allowed = False
 
@@ -958,8 +1120,6 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
-    db = get_db(guild.id)
-
     bingo = db.get_active_bingo(guild.id)
     if not bingo or not bingo["signup_message_id"]:
         return
@@ -971,20 +1131,21 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 # ----------------------------
 # Background tick: close signups, create teams, reveal board, start bingo
 # ----------------------------
+from datetime import timedelta  # placed here to avoid clutter above
 
 @tasks.loop(seconds=30)
 async def bingo_tick():
-    # One DB per guild: check each guild's active bingos.
-    for guild in list(bot.guilds):
-        db = get_db(guild.id)
-        for row in db.get_due_actions():
-            try:
-                await handle_bingo_state(guild, db, row)
-            except Exception as e:
-                log.exception("bingo_tick error (guild %s): %s", guild.id, e)
+    for row in db.get_due_actions():
+        try:
+            await handle_bingo_state(row)
+        except Exception as e:
+            log.exception("bingo_tick error: %s", e)
 
 
-async def handle_bingo_state(guild: discord.Guild, db: BingoDB, bingo: sqlite3.Row):
+async def handle_bingo_state(bingo: sqlite3.Row):
+    guild = bot.get_guild(int(bingo["guild_id"]))
+    if not guild:
+        return
     gs = db.get_guild_settings(guild.id)
     if not gs:
         return
