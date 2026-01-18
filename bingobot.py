@@ -5,7 +5,7 @@ import asyncio
 import random
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
 
@@ -13,11 +13,22 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+from pathlib import Path
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/bingobot.sqlite")
-DATA_DIR = os.getenv("DATA_DIR", "./data")
+
+# Base data directory (you can still override via .env)
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
+GUILDS_DIR = DATA_DIR / "guilds"
+
+def db_path_for_guild(guild_id: int) -> Path:
+    """Option A: one sqlite DB per guild."""
+    guild_dir = GUILDS_DIR / str(guild_id)
+    guild_dir.mkdir(parents=True, exist_ok=True)
+    return guild_dir / "bingobot.sqlite"
+
 
 SIGNUP_EMOJI = "✅"
 UNSIGN_EMOJI = "❌"
@@ -29,9 +40,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("bingobot")
 
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "boards"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "submissions"), exist_ok=True)
+# Ensure base folders exist (per-guild folders are created lazily when needed)
+GUILDS_DIR.mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "boards").mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "submissions").mkdir(parents=True, exist_ok=True)
 
 
 def utc_now() -> datetime:
@@ -88,8 +100,9 @@ class GuildSettings:
 
 
 class BingoDB:
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, guild_id: int):
+        self.guild_id = int(guild_id)
+        self.path = db_path_for_guild(self.guild_id)
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
@@ -97,6 +110,7 @@ class BingoDB:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
+
 
     def _init_db(self) -> None:
         with self._conn() as con:
@@ -190,7 +204,8 @@ class BingoDB:
 
     def get_guild_settings(self, guild_id: int) -> Optional[GuildSettings]:
         with self._conn() as con:
-            row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?;", (guild_id,)).fetchone()
+            # This DB instance is already scoped to a single guild.
+            row = con.execute("SELECT * FROM guild_settings WHERE guild_id=?;", (self.guild_id,)).fetchone()
             if not row:
                 return None
             return GuildSettings(
@@ -210,7 +225,7 @@ class BingoDB:
                 WHERE guild_id=? AND status IN ('setup','signup_open','signup_closed','running')
                 ORDER BY id DESC LIMIT 1;
                 """,
-                (guild_id,),
+                (self.guild_id,),
             ).fetchone()
             return row
 
@@ -243,7 +258,7 @@ class BingoDB:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'signup_open', ?, ?, ?);
                 """,
                 (
-                    guild_id,
+                    self.guild_id,
                     name,
                     game_mode,
                     team_size,
@@ -418,7 +433,17 @@ intents.reactions = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-db = BingoDB(DB_PATH)
+
+# One DB per guild (Option A): cache instances so we don't constantly reopen/init.
+_DB_CACHE: dict[int, BingoDB] = {}
+
+def get_db(guild_id: int) -> BingoDB:
+    gid = int(guild_id)
+    db = _DB_CACHE.get(gid)
+    if db is None:
+        db = BingoDB(gid)
+        _DB_CACHE[gid] = db
+    return db
 
 
 async def dm_ask(user: discord.abc.User, prompt: str, timeout: int = 300) -> Optional[discord.Message]:
@@ -477,6 +502,7 @@ async def update_leaderboard(guild: discord.Guild, gs: GuildSettings, bingo: sql
     if not isinstance(ann, discord.TextChannel):
         return
 
+    db = get_db(guild.id)
     counts = db.leaderboard_counts(bingo["id"])
     lines = []
     if not counts:
@@ -513,6 +539,7 @@ async def on_ready():
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def bingosetup(ctx: commands.Context):
+    db = get_db(ctx.guild.id)
     active = db.get_active_bingo(ctx.guild.id)
     if active:
         await ctx.reply("There is already an active bingo on this server. End it (not implemented yet) or remove it from the DB.")
@@ -632,7 +659,7 @@ async def bingosetup(ctx: commands.Context):
     if close_hours is None:
         await user.send("Invalid number. Setup cancelled.")
         return
-    signup_close_utc = start_utc - timedelta(hours=close_hours)  # noqa: F821
+    signup_close_utc = start_utc - timedelta(hours=close_hours)
 
     m = await dm_ask(user, "Which role to notify? Mention like `<@&123>` or type `none`")
     if not m:
@@ -748,6 +775,7 @@ async def handle_submission(
     description: str,
     attachments: List[discord.Attachment],
 ):
+    db = get_db(guild.id)
     bingo = db.get_active_bingo(guild.id)
     if not bingo:
         await channel.send("No active bingo found on this server.")
@@ -846,6 +874,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
+    db = get_db(guild.id)
+
     gs = db.get_guild_settings(guild.id)
     if not gs:
         return
@@ -928,6 +958,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
+    db = get_db(guild.id)
+
     bingo = db.get_active_bingo(guild.id)
     if not bingo or not bingo["signup_message_id"]:
         return
@@ -939,21 +971,20 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 # ----------------------------
 # Background tick: close signups, create teams, reveal board, start bingo
 # ----------------------------
-from datetime import timedelta  # placed here to avoid clutter above
 
 @tasks.loop(seconds=30)
 async def bingo_tick():
-    for row in db.get_due_actions():
-        try:
-            await handle_bingo_state(row)
-        except Exception as e:
-            log.exception("bingo_tick error: %s", e)
+    # One DB per guild: check each guild's active bingos.
+    for guild in list(bot.guilds):
+        db = get_db(guild.id)
+        for row in db.get_due_actions():
+            try:
+                await handle_bingo_state(guild, db, row)
+            except Exception as e:
+                log.exception("bingo_tick error (guild %s): %s", guild.id, e)
 
 
-async def handle_bingo_state(bingo: sqlite3.Row):
-    guild = bot.get_guild(int(bingo["guild_id"]))
-    if not guild:
-        return
+async def handle_bingo_state(guild: discord.Guild, db: BingoDB, bingo: sqlite3.Row):
     gs = db.get_guild_settings(guild.id)
     if not gs:
         return
